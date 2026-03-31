@@ -1,0 +1,171 @@
+import os
+import sys
+import time
+import threading
+import cv2
+import numpy as np
+import pytesseract
+from mss import mss
+import winsound
+import ctypes
+import interception
+import tkinter as tk
+from tkinter import ttk
+
+# ==========================================
+# 🛡️ 1. บังคับรัน Admin
+# ==========================================
+if not ctypes.windll.shell32.IsUserAnAdmin():
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(_file_)}"', None, 1)
+    sys.exit()
+
+os.chdir(os.path.dirname(os.path.abspath(_file_)))
+
+# ==========================================
+# ⚙️ 2. ตั้งค่า Tesseract & ตัวแปร Global
+# ==========================================
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+current_weapon = "NONE"
+is_running = True
+sens_value = 0.55
+modifier = (4 / sens_value)
+WEAPON_PATTERNS = {}
+
+# รายชื่อปืนที่คุณต้องการให้อ่าน (อิงจากโค้ดเดิมของคุณ)
+KNOWN_WEAPONS = [
+    "HAVOC", "FLATLINE", "HEMLOK", "R-301", "R301", "NEMESIS",
+    "ALTERNATOR", "PROWLER", "R-99", "R99", "VOLT", "C.A.R.", "CAR SMG", "CAR",
+    "DEVOTION", "L-STAR", "LSTAR", "SPITFIRE", "RAMPAGE",
+    "G7 SCOUT", "TRIPLE TAKE", "30-30", "BOCEK",
+    "CHARGE RIFLE", "LONGBOW", "KRABER", "SENTINEL",
+    "EVA-8", "EVA8", "MASTIFF", "MOZAMBIQUE", "PEACEKEEPER",
+    "RE-45", "RE45", "P2020", "WINGMAN"
+]
+
+def load_all_patterns():
+    global WEAPON_PATTERNS
+    for file in os.listdir("."):
+        if file.endswith(".txt"):
+            name = file.replace(".txt", "").upper()
+            pattern = []
+            with open(file, 'r') as f:
+                for line in f:
+                    p = line.strip().split(',')
+                    if len(p) >= 3:
+                        pattern.append((float(p[0]), float(p[1]), float(p[2])))
+            # เผื่อกรณีไฟล์ชื่อ R99.txt แต่ปืนอ่านได้ R-99
+            if name == "R99": WEAPON_PATTERNS["R-99"] = pattern 
+            elif name == "R301": WEAPON_PATTERNS["R-301"] = pattern
+            else: WEAPON_PATTERNS[name] = pattern
+            
+    print(f"📦 โหลดแพทเทิร์นปืน: {list(WEAPON_PATTERNS.keys())}")
+
+load_all_patterns()
+
+# ==========================================
+# 🖱️ 3. ระบบ Recoil (Interception)
+# ==========================================
+def precise_sleep(duration_ms):
+    target = time.perf_counter() + (duration_ms / 1000.0)
+    while time.perf_counter() < target: pass 
+
+def recoil_thread():
+    global current_weapon, is_running, modifier
+    user32 = ctypes.windll.user32
+    while is_running:
+        if (user32.GetAsyncKeyState(0x01) & 0x8000) and (user32.GetAsyncKeyState(0x02) & 0x8000):
+            if current_weapon in WEAPON_PATTERNS:
+                for x, y, interval in WEAPON_PATTERNS[current_weapon]:
+                    if not (user32.GetAsyncKeyState(0x01) & 0x8000) or not (user32.GetAsyncKeyState(0x02) & 0x8000) or not is_running:
+                        break
+                    interception.move_relative(int(x * modifier), int(y * modifier))
+                    precise_sleep(interval)
+        precise_sleep(1)
+
+threading.Thread(target=recoil_thread, daemon=True).start()
+
+# ==========================================
+# 👁️ 4. ระบบ OCR (ใช้สูตรภาพจากโค้ดเดิมของคุณเป๊ะๆ)
+# ==========================================
+def update_ui_weapon(new_weapon):
+    ui_weapon_label.config(text=f"Weapon: {new_weapon}", foreground="#00FF00")
+
+def ocr_thread():
+    global current_weapon, is_running
+    sct = mss()
+    if len(sct.monitors) < 3:
+        print("❌ ไม่พบจอที่ 2")
+        return
+        
+    m2 = sct.monitors[2]
+    # ใช้พิกัดเดิมที่คุณตั้งไว้เป๊ะๆ
+    monitor_hud = {"top": m2["top"] + 1025, "left": m2["left"] + 1480, "width": 440, "height": 40}
+    custom_config = r'--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789'
+    
+    while is_running:
+        sct_img = sct.grab(monitor_hud)
+        frame = np.array(sct_img)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        # 🌟 สูตรแต่งภาพขาวดำจากโค้ดเดิมของคุณ 🌟
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        ret, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        raw_text = text.strip().upper()
+
+        detected = None
+        for weapon in KNOWN_WEAPONS:
+            if weapon in raw_text:
+                detected = weapon
+                break
+
+        if detected and detected != current_weapon:
+            current_weapon = detected
+            print(f"🔫 ถือปืน: {current_weapon}")
+            winsound.Beep(1000, 150)
+            root.after(0, update_ui_weapon, current_weapon)
+            
+        time.sleep(0.3)
+
+threading.Thread(target=ocr_thread, daemon=True).start()
+
+# ==========================================
+# 🖥️ 5. ระบบ UI
+# ==========================================
+def update_sens():
+    global sens_value, modifier
+    try:
+        new_sens = float(sens_entry.get())
+        if new_sens > 0:
+            sens_value = new_sens
+            modifier = (4 / sens_value)
+            print(f"⚙️ อัปเดต Sens: {sens_value}")
+            winsound.Beep(440, 100)
+    except ValueError:
+        pass
+
+root = tk.Tk()
+root.title("Apex Recoil")
+root.geometry("250x180")
+root.attributes("-topmost", True)
+
+ttk.Label(root, text="Sensitivity:").pack(pady=5)
+sens_entry = ttk.Entry(root, justify="center")
+sens_entry.insert(0, str(sens_value))
+sens_entry.pack(pady=5)
+ttk.Button(root, text="Update", command=update_sens).pack(pady=5)
+
+ui_weapon_label = ttk.Label(root, text=f"Weapon: NONE", font=("Arial", 12, "bold"))
+ui_weapon_label.pack(pady=15)
+
+def on_closing():
+    global is_running
+    is_running = False
+    root.destroy()
+    sys.exit()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+root.mainloop()
